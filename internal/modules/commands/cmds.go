@@ -13,13 +13,16 @@ import (
 	"github.com/openai/openai-go"
 	"github.com/slack-go/slack"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/dynoinc/ratchet/internal"
 	"github.com/dynoinc/ratchet/internal/docs"
 	"github.com/dynoinc/ratchet/internal/inbuilt_tools"
 	"github.com/dynoinc/ratchet/internal/llm"
+	rsemconv "github.com/dynoinc/ratchet/internal/otel/semconv"
 	rsemconv "github.com/dynoinc/ratchet/internal/otel/semconv"
 	"github.com/dynoinc/ratchet/internal/slack_integration"
 	"github.com/dynoinc/ratchet/internal/storage/schema"
@@ -233,12 +236,20 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 	// Add top message to conversation history
 	topMsgText := strings.TrimPrefix(topMsg.Attrs.Message.Text, fmt.Sprintf("<@%s> ", botID))
 	conversationHistory = append(conversationHistory, openai.UserMessage(topMsgText))
+	span.AddEvent(string(rsemconv.GenAiUserMessageKey), trace.WithAttributes(
+		semconv.GenAiSystemOpenai,
+		rsemconv.GenAiMessageContentKey.String(topMsgText),
+	))
 
 	// Add thread history
 	for _, threadMsg := range threadMessages {
 		if threadMsg.Attrs.Message.User == c.slackIntegration.BotUserID() {
 			// Assistant message
 			conversationHistory = append(conversationHistory, openai.AssistantMessage(threadMsg.Attrs.Message.Text))
+			span.AddEvent(string(rsemconv.GenAiAssistantMessageKey), trace.WithAttributes(
+				semconv.GenAiSystemOpenai,
+				rsemconv.GenAiMessageContentKey.String(threadMsg.Attrs.Message.Text),
+			))
 		} else {
 			// User message
 			threadMsgText := strings.TrimPrefix(threadMsg.Attrs.Message.Text, fmt.Sprintf("<@%s> ", c.slackIntegration.BotUserID()))
@@ -256,6 +267,7 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 		toolCalls := completion.Choices[0].Message.ToolCalls
 		if len(toolCalls) == 0 {
 			response = completion.Choices[0].Message.Content
+			span.AddEvent("completion.message", trace.WithAttributes(attribute.String("message", response)))
 			break
 		}
 
@@ -273,6 +285,23 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 			}
 
 			slog.DebugContext(ctx, "calling tool", "tool", toolCall.Function.Name, "id", toolCall.ID)
+			// MCP library doesn't support tracing, so create inner span for each tool call
+			var innerSpan trace.Span
+			if span.IsRecording() {
+				ctx, innerSpan = c.tracer.Start(ctx, "mcp.tool.call",
+					trace.WithAttributes(
+						rsemconv.ToolNameKey.String(toolCall.Function.Name),
+						rsemconv.ToolCallIDKey.String(toolCall.ID),
+					),
+				)
+				for k, v := range args {
+					innerSpan.AddEvent("args", trace.WithAttributes(attribute.String(k, fmt.Sprintf("%+v", v))))
+				}
+			} else {
+				// noop span
+				innerSpan = trace.SpanFromContext(context.Background())
+			}
+
 			res, err := client.CallTool(ctx, mcp.CallToolRequest{
 				Params: mcp.CallToolParams{
 					Name:      toolCall.Function.Name,
@@ -281,7 +310,11 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 			})
 			slog.DebugContext(ctx, "tool call result", "tool", toolCall.Function.Name, "id", toolCall.ID, "error", err)
 
+
 			if err != nil {
+				innerSpan.RecordError(err)
+				innerSpan.SetStatus(codes.Error, err.Error())
+				innerSpan.End()
 				return "", fmt.Errorf("tool %q execution failed: %w", toolCall.Function.Name, err)
 			}
 
@@ -291,22 +324,31 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 			}
 
 			parts := []openai.ChatCompletionContentPartTextParam{}
+			partsStr := []string{}
 			for _, content := range res.Content {
 				if text, ok := mcp.AsTextContent(content); ok {
 					parts = append(parts, openai.ChatCompletionContentPartTextParam{
 						Type: "text",
 						Text: text.Text,
 					})
+					partsStr = append(partsStr, text.Text)
 				}
 			}
 
+			conversationHistory = append(conversationHistory, openai.ChatCompletionMessageParamUnion{
 			conversationHistory = append(conversationHistory, openai.ChatCompletionMessageParamUnion{
 				OfTool: &openai.ChatCompletionToolMessageParam{
 					ToolCallID: toolCall.ID,
 					Content:    openai.ChatCompletionToolMessageParamContentUnion{OfArrayOfContentParts: parts},
 				},
 			})
+			innerSpan.AddEvent("tool.content", trace.WithAttributes(attribute.String("tool.id", toolCall.ID), attribute.StringSlice("parts", partsStr)))
 		}
+	}
+
+	span.SetAttributes(rsemconv.ResponseMessageSizeKey.Int(len(response)))
+	if response == "" {
+		span.SetStatus(codes.Error, "empty response")
 	}
 
 	span.SetAttributes(rsemconv.ResponseMessageSizeKey.Int(len(response)))

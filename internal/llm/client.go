@@ -23,6 +23,8 @@ import (
 	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/shared"
 	"github.com/qri-io/jsonschema"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/dynoinc/ratchet/internal/storage/schema"
 	"github.com/dynoinc/ratchet/internal/storage/schema/dto"
@@ -56,6 +58,7 @@ type Client interface {
 type client struct {
 	client openai.Client
 	cfg    Config
+	tracer trace.Tracer
 }
 
 func persistLLMUsageMiddleware(db *pgxpool.Pool) option.Middleware {
@@ -257,6 +260,7 @@ func New(ctx context.Context, cfg Config, db *pgxpool.Pool) (Client, error) {
 	return &client{
 		client: openaiClient,
 		cfg:    cfg,
+		tracer: otel.Tracer("ratchet.llm.client"),
 	}, nil
 }
 

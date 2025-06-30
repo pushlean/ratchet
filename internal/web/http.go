@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"riverqueue.com/riverui"
 
 	"github.com/dynoinc/ratchet/internal"
@@ -367,6 +368,7 @@ func (h *httpHandlers) postRefresh(r *http.Request) (any, error) {
 }
 
 func (h *httpHandlers) generateCommand(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	channelID := r.URL.Query().Get("channel_id")
 	threadTS := r.URL.Query().Get("ts")
 	if channelID == "" || threadTS == "" {
@@ -374,7 +376,7 @@ func (h *httpHandlers) generateCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := h.bot.GetMessage(r.Context(), channelID, threadTS)
+	msg, err := h.bot.GetMessage(ctx, channelID, threadTS)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("getting message: %v", err), http.StatusInternalServerError)
 		return
@@ -391,6 +393,7 @@ func (h *httpHandlers) generateCommand(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpHandlers) respondCommand(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	channelID := r.URL.Query().Get("channel_id")
 	threadTS := r.URL.Query().Get("ts")
 	if channelID == "" || threadTS == "" {
@@ -398,7 +401,7 @@ func (h *httpHandlers) respondCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := h.bot.GetMessage(r.Context(), channelID, threadTS)
+	msg, err := h.bot.GetMessage(ctx, channelID, threadTS)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "message not found", http.StatusNotFound)
