@@ -23,7 +23,6 @@ import (
 	"github.com/dynoinc/ratchet/internal/inbuilt_tools"
 	"github.com/dynoinc/ratchet/internal/llm"
 	rsemconv "github.com/dynoinc/ratchet/internal/otel/semconv"
-	rsemconv "github.com/dynoinc/ratchet/internal/otel/semconv"
 	"github.com/dynoinc/ratchet/internal/slack_integration"
 	"github.com/dynoinc/ratchet/internal/storage/schema"
 	"github.com/dynoinc/ratchet/internal/storage/schema/dto"
@@ -129,6 +128,7 @@ func (c *Commands) Generate(ctx context.Context, channelID string, slackTS strin
 
 	var openAITools []openai.ChatCompletionToolParam
 	toolToClient := make(map[string]*client.Client)
+	toolByName := make(map[string]mcp.Tool)
 	for _, mcpClient := range c.mcpClients {
 		tools, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{})
 		if err != nil {
@@ -163,6 +163,7 @@ func (c *Commands) Generate(ctx context.Context, channelID string, slackTS strin
 			})
 
 			toolToClient[t.Name] = mcpClient
+			toolByName[t.Name] = t
 		}
 	}
 
@@ -233,23 +234,16 @@ Keep responses under 3000 characters.
 Always be thorough in using tools to provide accurate, up-to-date information rather than making assumptions.`
 
 	conversationHistory = append(conversationHistory, openai.SystemMessage(systemPrompt))
+
 	// Add top message to conversation history
 	topMsgText := strings.TrimPrefix(topMsg.Attrs.Message.Text, fmt.Sprintf("<@%s> ", botID))
 	conversationHistory = append(conversationHistory, openai.UserMessage(topMsgText))
-	span.AddEvent(string(rsemconv.GenAiUserMessageKey), trace.WithAttributes(
-		semconv.GenAiSystemOpenai,
-		rsemconv.GenAiMessageContentKey.String(topMsgText),
-	))
 
 	// Add thread history
 	for _, threadMsg := range threadMessages {
 		if threadMsg.Attrs.Message.User == c.slackIntegration.BotUserID() {
 			// Assistant message
 			conversationHistory = append(conversationHistory, openai.AssistantMessage(threadMsg.Attrs.Message.Text))
-			span.AddEvent(string(rsemconv.GenAiAssistantMessageKey), trace.WithAttributes(
-				semconv.GenAiSystemOpenai,
-				rsemconv.GenAiMessageContentKey.String(threadMsg.Attrs.Message.Text),
-			))
 		} else {
 			// User message
 			threadMsgText := strings.TrimPrefix(threadMsg.Attrs.Message.Text, fmt.Sprintf("<@%s> ", c.slackIntegration.BotUserID()))
@@ -267,7 +261,6 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 		toolCalls := completion.Choices[0].Message.ToolCalls
 		if len(toolCalls) == 0 {
 			response = completion.Choices[0].Message.Content
-			span.AddEvent("completion.message", trace.WithAttributes(attribute.String("message", response)))
 			break
 		}
 
@@ -278,45 +271,18 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 				slog.ErrorContext(ctx, "Tool not found", "tool", toolCall.Function.Name)
 				continue
 			}
-
-			var args map[string]any
-			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
-				return "", fmt.Errorf("unmarshalling tool call arguments: %w", err)
+			tool, ok := toolByName[toolCall.Function.Name]
+			if !ok {
+				slog.ErrorContext(ctx, "Tool not found", "tool", toolCall.Function.Name)
+				continue
 			}
 
 			slog.DebugContext(ctx, "calling tool", "tool", toolCall.Function.Name, "id", toolCall.ID)
-			// MCP library doesn't support tracing, so create inner span for each tool call
-			var innerSpan trace.Span
-			if span.IsRecording() {
-				ctx, innerSpan = c.tracer.Start(ctx, "mcp.tool.call",
-					trace.WithAttributes(
-						rsemconv.ToolNameKey.String(toolCall.Function.Name),
-						rsemconv.ToolCallIDKey.String(toolCall.ID),
-					),
-				)
-				for k, v := range args {
-					innerSpan.AddEvent("args", trace.WithAttributes(attribute.String(k, fmt.Sprintf("%+v", v))))
-				}
-			} else {
-				// noop span
-				innerSpan = trace.SpanFromContext(context.Background())
-			}
-
-			res, err := client.CallTool(ctx, mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      toolCall.Function.Name,
-					Arguments: args,
-				},
-			})
-			slog.DebugContext(ctx, "tool call result", "tool", toolCall.Function.Name, "id", toolCall.ID, "error", err)
-
-
+			res, err := c.callTool(ctx, client, tool, toolCall)
 			if err != nil {
-				innerSpan.RecordError(err)
-				innerSpan.SetStatus(codes.Error, err.Error())
-				innerSpan.End()
 				return "", fmt.Errorf("tool %q execution failed: %w", toolCall.Function.Name, err)
 			}
+			slog.DebugContext(ctx, "tool call result", "tool", toolCall.Function.Name, "id", toolCall.ID, "error", err)
 
 			if res.IsError {
 				jsn, _ := json.Marshal(res)
@@ -324,31 +290,22 @@ Always be thorough in using tools to provide accurate, up-to-date information ra
 			}
 
 			parts := []openai.ChatCompletionContentPartTextParam{}
-			partsStr := []string{}
 			for _, content := range res.Content {
 				if text, ok := mcp.AsTextContent(content); ok {
 					parts = append(parts, openai.ChatCompletionContentPartTextParam{
 						Type: "text",
 						Text: text.Text,
 					})
-					partsStr = append(partsStr, text.Text)
 				}
 			}
 
-			conversationHistory = append(conversationHistory, openai.ChatCompletionMessageParamUnion{
 			conversationHistory = append(conversationHistory, openai.ChatCompletionMessageParamUnion{
 				OfTool: &openai.ChatCompletionToolMessageParam{
 					ToolCallID: toolCall.ID,
 					Content:    openai.ChatCompletionToolMessageParamContentUnion{OfArrayOfContentParts: parts},
 				},
 			})
-			innerSpan.AddEvent("tool.content", trace.WithAttributes(attribute.String("tool.id", toolCall.ID), attribute.StringSlice("parts", partsStr)))
 		}
-	}
-
-	span.SetAttributes(rsemconv.ResponseMessageSizeKey.Int(len(response)))
-	if response == "" {
-		span.SetStatus(codes.Error, "empty response")
 	}
 
 	span.SetAttributes(rsemconv.ResponseMessageSizeKey.Int(len(response)))
@@ -402,4 +359,59 @@ func (c *Commands) Respond(ctx context.Context, channelID string, slackTS string
 	}
 
 	return nil
+}
+
+// callTool wraps client.CallTool with OpenTelemetry tracing
+func (c *Commands) callTool(ctx context.Context, client *client.Client, tool mcp.Tool, toolCall openai.ChatCompletionMessageToolCall) (*mcp.CallToolResult, error) {
+	parentSpan := trace.SpanFromContext(ctx)
+	var span trace.Span
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+		return nil, fmt.Errorf("unmarshalling tool call arguments: %w", err)
+	}
+
+	if parentSpan != nil && parentSpan.SpanContext().IsValid() {
+		spanName := fmt.Sprintf("%s %s", llm.OperationExecuteTool, tool.Name)
+		attributes := []attribute.KeyValue{
+			llm.GenAIOperationNameKey.String(string(llm.OperationExecuteTool)),
+			llm.GenAIToolNameKey.String(tool.Name),
+			llm.GenAIToolCallIDKey.String(toolCall.ID),
+		}
+		if tool.Description != "" {
+			attributes = append(attributes, llm.GenAIToolDescriptionKey.String(tool.Description))
+		}
+
+		ctx, span = c.tracer.Start(ctx, spanName,
+			trace.WithAttributes(attributes...),
+			trace.WithSpanKind(trace.SpanKindInternal),
+		)
+	} else {
+		// noop span
+		span = trace.SpanFromContext(context.Background())
+	}
+	defer span.End()
+
+	res, err := client.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      toolCall.Function.Name,
+			Arguments: args,
+		},
+	})
+
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.SetAttributes(semconv.ErrorTypeKey.String(fmt.Sprintf("%T", err)))
+		return nil, err
+	}
+
+	if res.IsError {
+		span.SetStatus(codes.Error, "tool execution returned error")
+		span.SetAttributes(semconv.ErrorTypeKey.String("tool_execution_error"))
+	} else {
+		span.SetStatus(codes.Ok, "tool execution successful")
+	}
+
+	return res, nil
 }
